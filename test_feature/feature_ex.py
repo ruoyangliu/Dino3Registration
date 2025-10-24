@@ -19,11 +19,13 @@ from transformers import AutoImageProcessor, AutoModel
 
 # ========= 配置 =========
 MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"
-IMG_PATH = "G:\\Dino3Registration\\test_feature\\MRI_image\\Case1-T1.jpeg"
-SAVE_PATH = "encoder_focus_grid_masked_US_vitl16.png"
+IMG_PATH = "G:\\Dino3Registration\\data\\sliced_png\\Case6\\MRI\\coronal\\slice_224.png"
+
+SAVE_PATH = "encoder_focus_grid_masked_MRi_vitl16.png"
+
 NUM_MAPS = 8           # 四周展示多少张（建议 8）
 ALPHA = 0.5            # 叠加透明度
-METRIC = "mass"        # 选图指标: 'mass' (ROI内积分) 或 'contrast' (ROI vs BG 对比)
+METRIC = "contrast"        # 选图指标: 'mass' (ROI内积分) 或 'contrast' (ROI vs BG 对比)
 USE_ATT_LAST = True    # True: 只看最后一层注意力；False: 会回退到特征范数或多层
 
 # ========= 小工具 =========
@@ -130,6 +132,8 @@ def main():
     inputs = processor(images=img, return_tensors="pt")
     with torch.no_grad():
         out = model(**inputs, output_attentions=True, output_hidden_states=True)
+    #print total out shapes
+    print(f"[info] model output 总形状: {tuple(out.shape)}")
 
     print(f"[info] hidden_states 总层数: {len(out.hidden_states)}")
     for i, hs in enumerate(out.hidden_states):

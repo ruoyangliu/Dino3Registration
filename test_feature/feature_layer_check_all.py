@@ -19,7 +19,7 @@ from transformers import AutoImageProcessor, AutoModel
 
 # ========= 配置 =========
 MODEL_NAME = "facebook/dinov3-vitl16-pretrain-lvd1689m"
-IMG_PATH = "G:\\Dino3Registration\\test_feature\\MRI_image\\Case1-T1.jpeg"
+IMG_PATH = "G:\\Dino3Registration\\data\\sliced_png\\Case6\\US\\sagittal\\slice_086.png"
 SAVE_PATH = "encoder_focus_grid_masked_US_vitl16.png"
 NUM_MAPS = 8           # 四周展示多少张（建议 8）
 ALPHA = 0.5            # 叠加透明度
@@ -60,11 +60,11 @@ def upsample(hm_t: torch.Tensor, H0: int, W0: int) -> np.ndarray:
 def build_fg_mask_from_nonzero(img_pil: Image.Image, bg_value: int = 0, tol: int = 0,
                                min_keep_ratio: float = 0.02) -> np.ndarray:
     """
-    用“灰度 != bg_value”作为前景（非二次阈值/自适应），最直接的前景获取。
-    - bg_value: 背景像素值（默认0）。如是JPEG有压缩噪声，可配合 tol 使用。
-    - tol: 容差；当 tol>0 时，判定条件变为 |gray - bg_value| > tol。
-    - min_keep_ratio: 若前景面积极小（可能图像本身没有0背景），则回退为全1（不过滤）。
-    返回: (H,W) 0/1 掩膜
+    Use "grayscale != bg_value" as the foreground (non-quadratic thresholding/adaptive), the most direct foreground acquisition.
+    - bg_value: Background pixel value (default 0). For JPEG images with compression noise, this can be used in conjunction with tol.
+    - tol: Tolerance; when tol > 0, the judgment condition becomes |gray - bg_value| > tol.
+    - min_keep_ratio: If the foreground area is very small (perhaps the image itself does not have a zero background), fallback to all 1s (no filtering).
+    Return: (H,W) 0/1 mask
     """
     img = np.array(img_pil)
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) if img.ndim == 3 else img
@@ -101,19 +101,6 @@ def maskwise_normalize(hm: np.ndarray, mask: np.ndarray, eps=1e-8) -> np.ndarray
     return out
 
 
-
-def score_map(hm: np.ndarray, mask: np.ndarray, metric="mass") -> float:
-    """给热力图一个分数，用于选 top-k"""
-    area_fg = mask.sum() + 1e-8
-    if metric == "mass":
-        return float((hm * (mask > 0)).sum() / area_fg)
-    # 对比度：前景中位-背景中位，归一到前景STD
-    fg = hm[mask == 1]
-    bg = hm[mask == 0]
-    if fg.size == 0 or bg.size == 0:
-        return 0.0
-    return float((np.median(fg) - np.median(bg)) / (np.std(fg) + 1e-6))
-
 def render_all_feature_layers(
     img_pil: Image.Image,
     out,
@@ -121,9 +108,9 @@ def render_all_feature_layers(
     Hp: int, Wp: int, num_patch: int,
     mask: np.ndarray,
     save_path: str,
-    cols: int = 6,           # 每行列数；24层的话 6列×4行正好
-    gamma: float = 0.7,      # 显示时的γ校正
-    dpi: int = 220,          # 保存分辨率
+    cols: int = 6,          
+    gamma: float = 0.7,     
+    dpi: int = 220,        
 ):
     """
     把所有 hidden_states(除embedding层) 的 patch特征L2范数热力图拼接成一张大图。
@@ -141,6 +128,10 @@ def render_all_feature_layers(
     L = len(layers)              # ViT-L 通常是 24
     for li, hs in enumerate(layers):  # li: 0..L-1
         # 只取真实 patch（屏蔽 CLS 与 register）
+        seq_len = int(hs.shape[1])
+        n_special = seq_len - (1 + num_patch)
+        assert n_special >= 0, f"[token error] seq_len={seq_len}, expected >= 1+{num_patch}"
+
         pt = hs[:, 1:1 + num_patch, :]          # (1, Hp*Wp, D)
         feat_norm = pt.norm(p=2, dim=-1)[0]     # (Hp*Wp,)
 
@@ -183,6 +174,137 @@ def render_all_feature_layers(
 
 
 
+def render_all_layers_pca_rgb(img_pil, out, Hp, Wp, num_patch, H0, W0, mask,
+                              cols=6, gamma=0.8, dpi=240, save_path="ALL_LAYERS_PCA_RGB.png"):
+    """
+   
+    """
+    layers = list(out.hidden_states)[1:]  # 去掉 embedding 层
+    L = len(layers)
+
+    rows = int(np.ceil(L / cols))
+    fig_w = cols * 3.0
+    fig_h = rows * 3.0
+    fig = plt.figure(figsize=(fig_w, fig_h))
+
+    for i, hs_layer in enumerate(layers):
+        # ===== 每层 PCA =====
+        seq_len = int(hs_layer.shape[1])
+        n_special = seq_len - (1 + num_patch)
+        assert n_special >= 0, f"[token error] seq_len={seq_len}, expected >= 1+{num_patch}"
+
+        X = hs_layer[:, 1:1+num_patch, :][0].cpu().numpy()   # (N,D)
+        Xc = X - X.mean(axis=0, keepdims=True)
+        U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+        Z = Xc @ Vt[:3, :].T   # (N,3)
+
+        pcs = []
+        for k in range(3):
+            pc = Z[:, k].reshape(Hp, Wp).astype(np.float32)
+            pc = upsample(torch.from_numpy(pc), H0, W0)
+            pc = maskwise_normalize(pc, mask)
+            pcs.append(pc)
+
+        rgb = np.stack(pcs, axis=-1)
+        ch_max = rgb.max(axis=(0,1)) + 1e-8
+        rgb = rgb / ch_max
+        if gamma is not None:
+            rgb = np.power(rgb, gamma)
+
+        # ===== 可视化 =====
+        ax = plt.subplot(rows, cols, i + 1)
+        ax.imshow(img_pil)
+        ax.imshow(rgb, alpha=0.6)
+        neg_idx = i - L   # -24 ... -1
+        ax.set_title(f"Layer {neg_idx}", fontsize=9)
+        ax.set_xticks([]); ax.set_yticks([])
+
+    plt.tight_layout()
+    big_path = os.path.splitext(save_path)[0] + "_ALL_LAYERS_PCA_RGB.png"
+    plt.savefig(big_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[done] 已保存所有层 PCA-RGB 大图: {big_path}")
+
+
+
+def compare_layers_pca_rgb(img_pil, out, Hp, Wp, num_patch, H0, W0, mask,
+                           layers_from_end=(24, 12, 3), gamma=0.8, save_path='',
+                           save_pc_grayscale=False):
+    
+    def upsample_np(arr: np.ndarray, H: int, W: int) -> np.ndarray:
+        return cv2.resize(arr, (W, H), interpolation=cv2.INTER_LINEAR)
+
+    fig, axes = plt.subplots(1, len(layers_from_end), figsize=(5*len(layers_from_end), 5))
+    if len(layers_from_end) == 1:
+        axes = [axes]
+
+    # reference PCA basis
+    V_ref = None   
+    #first layer explained variance ratio
+    explained_first = None  
+
+    for ax, layer_idx_from_end in zip(axes, layers_from_end):
+        # only choose the specified layer 
+        hs_layer = out.hidden_states[-layer_idx_from_end]
+
+        # token check
+        seq_len = int(hs_layer.shape[1])
+        n_special = seq_len - (1 + num_patch)
+        assert n_special >= 0, f"[token error] seq_len={seq_len}, expected >= 1+{num_patch}"
+
+        # only use the real patch features, not cls or register tokens
+        X = hs_layer[:, 1:1+num_patch, :][0].cpu().numpy()
+        Xc = X - X.mean(axis=0, keepdims=True)
+
+        # first time fit PCA basis use SVD
+        if V_ref is None:
+            U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+            V_ref = Vt[:3, :].T     # (D,3)
+            # explained variance ratio
+            explained_first = (S**2) / np.sum(S**2)
+            print("PCA:", explained_first[:3], "sum:", float(np.sum(explained_first[:3])))
+
+
+        #use the fixed PCA basis to transform other layers
+        Z = Xc @ V_ref            # (Np,3)
+
+        pcs = []
+        for k in range(3):
+            pc = Z[:, k].reshape(Hp, Wp).astype(np.float32)
+            #upsample to original size
+            pc = upsample_np(pc, H0, W0)                 
+            pc = maskwise_normalize(pc, mask)            
+            pcs.append(pc)
+
+        
+            if save_pc_grayscale:
+                pc_path = os.path.splitext(save_path)[0] + f"_layer-{layer_idx_from_end}_PC{k+1}.png"
+                plt.figure(figsize=(4,4)); plt.imshow(pc, cmap="jet"); plt.axis('off'); plt.tight_layout()
+                plt.savefig(pc_path, dpi=200, bbox_inches="tight"); plt.close()
+        #RGB generation
+        rgb = np.stack(pcs, axis=-1)    
+        # channel normalization
+        rgb = rgb / (rgb.max(axis=(0,1)) + 1e-8) 
+        #gamma correction        
+        if gamma is not None:
+            rgb = np.power(rgb, gamma)                   
+        #mask out the background
+        rgb *= mask[..., None]                           
+
+        ax.imshow(img_pil)                               
+        ax.imshow(rgb, alpha=0.6)
+        ax.set_title(f"Layer -{layer_idx_from_end} PCA-RGB")
+        ax.set_xticks([]); ax.set_yticks([])
+
+    plt.tight_layout()
+    root, ext = os.path.splitext(save_path)
+    sp = root + "_compare" + (ext if ext else ".png")
+    plt.savefig(sp, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[done] : {sp}")
+
+
+
 # ========= 主流程 =========
 def main():
     # 读图
@@ -196,7 +318,13 @@ def main():
     model.eval()
 
     # forward
-    inputs = processor(images=img, return_tensors="pt")
+    inputs = processor(
+    images=img,
+    return_tensors="pt",
+    do_resize=False,
+    do_center_crop=False
+)
+
 
     with torch.no_grad():
         out = model(**inputs, output_attentions=True, output_hidden_states=True)
@@ -204,28 +332,31 @@ def main():
         print(f"[info] hidden_states 总层数: {len(out.hidden_states)}")
         for i, hs in enumerate(out.hidden_states):
             print(f"  Layer {i:2d}: shape = {tuple(hs.shape)}")
+    
 
    
     
     # 计算 patch 网格
     _, _, Hs, Ws = inputs["pixel_values"].shape  # (B,C,H',W')
     p = get_patch_size(model)
+    
     Hp, Wp = Hs // p, Ws // p
     num_patch = Hp * Wp
 
     # 扇形前景掩膜（原图尺寸）
     mask = build_fg_mask_from_nonzero(img, bg_value=0, tol=0, min_keep_ratio=0.02)
-    render_all_feature_layers(
+
+    compare_layers_pca_rgb(
     img_pil=img,
     out=out,
-    H0=img.size[1], W0=img.size[0],   # 注意 PIL size=(W,H)
     Hp=Hp, Wp=Wp, num_patch=num_patch,
+    H0=img.size[1], W0=img.size[0],
     mask=mask,
-    save_path=SAVE_PATH,              # 用它生成 *_ALL_LAYERS.png
-    cols=6,                           # 24层→6列×4行
-    gamma=0.7,
-    dpi=220
+    layers_from_end=(24, 12, 3),   # 浅层 -24, 中层 -12, 深层 -3
+    save_path="MRI_US_PCA_RGB_COMPARE.png"
 )
+
+   
 
     heatmaps = []
     titles = []
