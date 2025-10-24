@@ -114,6 +114,75 @@ def score_map(hm: np.ndarray, mask: np.ndarray, metric="mass") -> float:
         return 0.0
     return float((np.median(fg) - np.median(bg)) / (np.std(fg) + 1e-6))
 
+def render_all_feature_layers(
+    img_pil: Image.Image,
+    out,
+    H0: int, W0: int,
+    Hp: int, Wp: int, num_patch: int,
+    mask: np.ndarray,
+    save_path: str,
+    cols: int = 6,           # 每行列数；24层的话 6列×4行正好
+    gamma: float = 0.7,      # 显示时的γ校正
+    dpi: int = 220,          # 保存分辨率
+):
+    """
+    把所有 hidden_states(除embedding层) 的 patch特征L2范数热力图拼接成一张大图。
+    - 自动忽略 CLS + register tokens，只取前 Hp*Wp 个真实 patch。
+    - 在 US 扇形前景内归一化，背景抑制为常数。
+    - 标注每层前景最大响应位置（红色+号）。
+    """
+    # 1) 拿到所有层（list[层], 每层 (B, 1+T_all, D)）
+    hs_list = list(out.hidden_states)
+    assert len(hs_list) >= 2, "hidden_states 里至少应包含 embedding 层和一个 block 输出"
+    layers = hs_list[1:]  # 去掉 embedding 层（第0层）
+
+    # 2) 逐层生成热力图
+    heatmaps, titles = [], []
+    L = len(layers)              # ViT-L 通常是 24
+    for li, hs in enumerate(layers):  # li: 0..L-1
+        # 只取真实 patch（屏蔽 CLS 与 register）
+        pt = hs[:, 1:1 + num_patch, :]          # (1, Hp*Wp, D)
+        feat_norm = pt.norm(p=2, dim=-1)[0]     # (Hp*Wp,)
+
+        hm = upsample(feat_norm.reshape(Hp, Wp), H0, W0)  # -> (H0,W0)
+        hm = maskwise_normalize(hm, mask)
+
+        # 负向层编号（与你之前风格一致：倒数第1层记为 -1）
+        neg_idx = li - L   # li=0 -> -L, li=L-1 -> -1
+        heatmaps.append(hm)
+        titles.append(f"Feat L2 layer {neg_idx}")
+
+    # 3) 画大网格
+    rows = int(np.ceil(L / cols))
+    fig_w = cols * 3.0      # 每格约 3 英寸，可按需调
+    fig_h = rows * 3.2
+    fig = plt.figure(figsize=(fig_w, fig_h))
+
+    for i, (hm, ttl) in enumerate(zip(heatmaps, titles)):
+        r, c = divmod(i, cols)
+        ax = plt.subplot(rows, cols, i + 1)
+        ax.imshow(img_pil)
+        show_hm = np.power(hm, gamma)           # γ 校正，抬亮高响应
+        ax.imshow(show_hm, cmap="jet", alpha=0.5)
+
+        # 只在前景内找峰值并标注
+        hm_fg = hm.copy()
+        hm_fg[mask == 0] = 0
+        if hm_fg.max() > 0:
+            y, x = np.unravel_index(np.argmax(hm_fg), hm_fg.shape)
+            ax.plot([x], [y], marker="+", color="red", markersize=8, markeredgewidth=1.8)
+
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(ttl, fontsize=9)
+
+    plt.tight_layout()
+    big_path = os.path.splitext(save_path)[0] + "_ALL_LAYERS.png"
+    plt.savefig(big_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[done] 已保存所有层可视化到: {big_path}")
+
+
+
 # ========= 主流程 =========
 def main():
     # 读图
@@ -128,12 +197,16 @@ def main():
 
     # forward
     inputs = processor(images=img, return_tensors="pt")
+
     with torch.no_grad():
         out = model(**inputs, output_attentions=True, output_hidden_states=True)
+        #check out full layer number and shape
+        print(f"[info] hidden_states 总层数: {len(out.hidden_states)}")
+        for i, hs in enumerate(out.hidden_states):
+            print(f"  Layer {i:2d}: shape = {tuple(hs.shape)}")
 
-    print(f"[info] hidden_states 总层数: {len(out.hidden_states)}")
-    for i, hs in enumerate(out.hidden_states):
-        print(f"  Layer {i:2d}: shape = {tuple(hs.shape)}")
+   
+    
     # 计算 patch 网格
     _, _, Hs, Ws = inputs["pixel_values"].shape  # (B,C,H',W')
     p = get_patch_size(model)
@@ -142,91 +215,23 @@ def main():
 
     # 扇形前景掩膜（原图尺寸）
     mask = build_fg_mask_from_nonzero(img, bg_value=0, tol=0, min_keep_ratio=0.02)
-
+    render_all_feature_layers(
+    img_pil=img,
+    out=out,
+    H0=img.size[1], W0=img.size[0],   # 注意 PIL size=(W,H)
+    Hp=Hp, Wp=Wp, num_patch=num_patch,
+    mask=mask,
+    save_path=SAVE_PATH,              # 用它生成 *_ALL_LAYERS.png
+    cols=6,                           # 24层→6列×4行
+    gamma=0.7,
+    dpi=220
+)
 
     heatmaps = []
     titles = []
 
-    # ========== if use attentions，用 CLS->patch ==========
-    if getattr(out, "attentions", None) is not None and out.attentions:
-        att = out.attentions[-1] if USE_ATT_LAST else out.attentions[0]  # (B, heads, 1+T_all, 1+T_all)
-        B, Hh, Ttok, _ = att.shape
-        assert B == 1
 
-        # 只取前 Hp*Wp 个 patch（忽略 register tokens）
-        cls2patch = att[:, :, 0, 1:1 + num_patch]  # (1, heads, Hp*Wp)
-        # 生成每个 head 的热力图（掩膜内归一化）
-        for h in range(cls2patch.shape[1]):
-            hm = cls2patch[0, h]  # (Hp*Wp,)
-            # 先自身归一化再上采样
-            hm = hm / (hm.max() + 1e-8)
-            hm = upsample(hm.reshape(Hp, Wp), H0, W0)
-            hm = maskwise_normalize(hm, mask)
-            heatmaps.append(hm)
-            titles.append(f"Attn Head {h}")
-        mode = "attn"
 
-    # ========== no attentions，use hidden states l2 norm ==========
-    else:
-        # code is going there
-        hs_list = list(out.hidden_states)  # list[层], 每层 (B, 1+T_all, D)
-        # 去掉 embedding 层（第 0 层），从后往前挑 NUM_MAPS*2 个候选，再选 top-k
-        hs_list = hs_list[1:]
-        candidates = []
-        for idx, hs in enumerate(hs_list[-(NUM_MAPS * 2):]):
-            pt = hs[:, 1:1 + num_patch, :]          # 只取前 Hp*Wp patch
-            feat_norm = pt.norm(p=2, dim=-1)[0]     # (Hp*Wp,)
-            hm = upsample(feat_norm.reshape(Hp, Wp), H0, W0)
-            hm = maskwise_normalize(hm, mask)
-            candidates.append((hm, f"Feat L2 layer {-len(hs_list) + (len(hs_list) - (NUM_MAPS * 2) + idx)}"))
-
-        # 评分并选 top-k
-        scored = [(score_map(h, mask, METRIC), i) for i, (h, _) in enumerate(candidates)]
-        scored.sort(reverse=True, key=lambda x: x[0])
-        keep_idx = [i for _, i in scored[:NUM_MAPS]]
-        for i in keep_idx:
-            heatmaps.append(candidates[i][0])
-            titles.append(candidates[i][1])
-        mode = "feat"
-
-    # ========== 画 3×3 网格 ==========
-    # 若不足 8 张，重复补足
-    if len(heatmaps) < NUM_MAPS:
-        heatmaps = heatmaps * (NUM_MAPS // max(1, len(heatmaps)) + 1)
-        titles = titles * (NUM_MAPS // max(1, len(titles)) + 1)
-    heatmaps = heatmaps[:NUM_MAPS]
-    titles = titles[:NUM_MAPS]
-
-    fig = plt.figure(figsize=(10, 10))
-    pos = [(1,1),(1,2),(1,3),
-           (2,1),       (2,3),
-           (3,1),(3,2),(3,3)]
-
-    for i, hm in enumerate(heatmaps[:8]):
-        r, c = pos[i]
-        ax = plt.subplot(3, 3, (r - 1) * 3 + c)
-        ax.imshow(img)
-        # γ 校正提升亮部（可调 0.6~0.8）
-        show_hm = np.power(hm, 0.7)
-        ax.imshow(show_hm, cmap="jet", alpha=ALPHA)
-        # 标红最大点（只在前景内查找）
-        hm_fg = hm.copy()
-        hm_fg[mask == 0] = 0
-        if hm_fg.max() > 0:
-            y, x = np.unravel_index(np.argmax(hm_fg), hm_fg.shape)
-            ax.plot([x], [y], marker="+", color="red", markersize=10, markeredgewidth=2)
-        ax.set_xticks([]); ax.set_yticks([])
-        ax.set_title(titles[i])
-
-    ax_mid = plt.subplot(3, 3, 5)
-    ax_mid.imshow(img); ax_mid.set_xticks([]); ax_mid.set_yticks([])
-    ax_mid.set_title("Original")
-
-    plt.tight_layout()
-    plt.savefig(SAVE_PATH, dpi=200, bbox_inches="tight")
-    plt.show()
-    print(f"[done] 已保存: {SAVE_PATH}")
-    print(f"[debug] grid={Hp}x{Wp}={num_patch}, patch={p}, mode={mode}, maps={len(heatmaps)}")
-
+        
 if __name__ == "__main__":
     main()
