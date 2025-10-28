@@ -21,6 +21,7 @@ ViT-S+/16 distilled  facebook/dinov3-vits16plus-pretrain-lvd1689m
 ViT-B/16 distilled  facebook/dinov3-vitb16-pretrain-lvd1689m
 ViT-L/16 distilled  facebook/dinov3-vitl16-pretrain-lvd1689m
 ViT-H+/16 distilled  facebook/dinov3-vith16plus-pretrain-lvd1689m
+
 ViT-7B/16   facebook/dinov3-vit7b16-pretrain-lvd1689m
 """
 
