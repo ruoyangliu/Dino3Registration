@@ -1,7 +1,7 @@
 from transformers import pipeline
 from transformers.image_utils import load_image
 
-url = "G:\\Dino3Registration\\data\\sliced_png\\Case6\\MRI\\coronal\\slice_224.png"
+url = "G:\\Dino3Registration\\data\\upsample_data\\Case6\\MRI\\slice_108_resampled.png"
 image = load_image(url)
 #print image size
 print(f"[info] image size: {image.size}")
@@ -16,4 +16,4 @@ features_np = np.array(features)
 print(features_np.shape)
 
 #save the features to a npy file
-np.save("G:\\Dino3Registration\\test_feature\\encoderTest\\pipelen_encoder_features_case6_mri_slice224.npy", features_np)
+#np.save("G:\\Dino3Registration\\test_feature\\encoderTest\\pipelen_encoder_features_case6_mri_slice224.npy", features_np)
